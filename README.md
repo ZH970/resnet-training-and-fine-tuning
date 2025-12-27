@@ -2,7 +2,7 @@
 
 本项目是对论文《Deep Residual Learning for Image Recognition》(He et al., 2016) 中提出的残差网络 (ResNet) 的复现，专注于 CIFAR-10 数据集上的图像分类任务。
 
-详细的实现分析与实验结果请查看我的博客文章：[深度残差网络(ResNet)代码实现详解：PyTorch复现CIFAR-10图像分类](https://onef1shy.github.io/blog.html?post=ResNet-Code)
+详细的实现分析与实验结果请查看我的博客文章：[深度残差网络(ResNet)代码实现详解：PyTorch复现CIFAR-10图像分类](https://onef1shy.github.io/2024/04/27/ResNet-Code/)
 
 ## 项目简介
 
@@ -34,8 +34,8 @@ CIFAR10_ResNet/
 ```
 
 ## 环境要求
-
-- Python 3.6+
+conda
+- Python 3.9
 - PyTorch 1.7+
 - torchvision
 - numpy
@@ -44,11 +44,13 @@ CIFAR10_ResNet/
 - seaborn
 - tqdm
 
+
+## 安装指南
+**直接看本项目根目录下的 upload.md 文件，里面有详细的 conda 环境创建与依赖安装步骤说明，不用看下面**
 可以通过以下命令安装依赖：
 
 ```bash
 pip install torch torchvision numpy matplotlib scikit-learn seaborn tqdm
-```
 
 ## 使用方法
 
@@ -112,12 +114,8 @@ chmod +x run.sh
 
 *注：原论文没有在CIFAR-10上测试标准ResNet(18/34/50)，这些是本项目的额外实验。
 
-更详细的性能分析和实验结果请参阅[博客文章](https://onef1shy.github.io/blog.html?post=ResNet-Code)。
+更详细的性能分析和实验结果请参阅[博客文章](https://onef1shy.github.io/2024/04/27/ResNet-Code/)。
 
 ## License
 
 MIT License © [onefishy](https://github.com/onef1shy)
-
-## ⭐ 支持项目
-
-欢迎 Fork 和 Star ⭐，也欢迎提出建议和 PR～
