@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import torch
@@ -18,6 +19,9 @@ from resnet import ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet20,
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='CIFAR-10 Training with ResNet')
+parser.add_argument('--dataset', type=str, default='CIFAR10',
+                    choices=['CIFAR10', 'CIFAR100', 'Cinic10', 'TinyImageNet', 'Food101', 'Caltech256'],
+                    help='Dataset to train/fine-tune on')
 parser.add_argument('--model', type=str, default='ResNet18',
                     choices=['ResNet18', 'ResNet34', 'ResNet50', 'ResNet101', 'ResNet152',
                              'ResNet20', 'ResNet32', 'ResNet44', 'ResNet56', 'ResNet110', 'ResNet1202'],
@@ -32,6 +36,11 @@ parser.add_argument('--results-dir', type=str,
                     default='./results', help='Directory to save results')
 parser.add_argument('--num-workers', type=int, default=4,
                     help='Number of worker threads for data loading')
+parser.add_argument('--valid', type=bool, default=True, help='Whether valid model')
+parser.add_argument('--pretrained-path', type=str, default=None,
+                    help='预训练模型 pth 路径（如: results/ResNet18/ResNet18_best.pth）')
+parser.add_argument('--freeze-backbone', action='store_true', default=None,
+                    help='是否冻结特征提取层，只训练最后分类层')
 args = parser.parse_args()
 
 
@@ -89,16 +98,29 @@ def main():
     ])
 
     print("Loading datasets...")
-    train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True,
-                                                 transform=transform_train)  # Training dataset
+    if args.dataset == 'CIFAR10':
+        train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True,
+                                                     transform=transform_train)  # Training dataset
+        val_dataset = torchvision.datasets.CIFAR10(
+            root='./data', train=False, download=True, transform=transform_test)
+    elif args.dataset == 'Cinic10':
+        cinic_root = './data/cinic'  # 你整理 CINIC-10 的根目录
+        train_dataset = torchvision.datasets.ImageFolder(
+            root=os.path.join(cinic_root, 'train'),
+            transform=transform_train
+        )
+        # 用 valid 作为验证集；也可以选 test
+        val_dataset = torchvision.datasets.ImageFolder(
+            root=os.path.join(cinic_root, 'valid'),
+            transform=transform_test
+        )
+    else:
+        raise ValueError(f"暂未实现数据集：{args.dataset}")
     # Use multiple workers on Windows and enable pin_memory for faster GPU transfer
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                               num_workers=args.num_workers, pin_memory=True)
-
-    val_dataset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform_test)
+                                               num_workers=args.num_workers, pin_memory=True, persistent_workers=False)
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=100, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+        val_dataset, batch_size=100, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=False)
     val_num = len(val_dataset)
     train_num = len(train_dataset)
     train_steps = len(train_loader)
@@ -128,8 +150,21 @@ def main():
     print(f"Using {model_name} model for training...")
     model = model_dict[model_name]().to(device)
 
+    # ===== 加载预训练权重（可选）=====
+    if args.pretrained_path is not None and os.path.exists(args.pretrained_path):
+        ckpt = torch.load(args.pretrained_path, map_location=device)
+        state = ckpt.get("model_state_dict", ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"Loaded pretrained from {args.pretrained_path}")
+        print(f"Missing keys: {missing}")
+        print(f"Unexpected keys: {unexpected}")
+    else:
+        if args.pretrained_path is not None:
+            print(f"预训练路径不存在: {args.pretrained_path}，跳过加载预训练")
+
     # Define model filename
-    model_filename = os.path.join(model_results_dir, f"{model_name}_best.pth")
+    raw_model_filename = os.path.join(model_results_dir, f"{model_name}_best.pth")
+    model_filename = get_unique_path(raw_model_filename)
 
     # Define results files
     results_csv_path = os.path.join(
@@ -203,6 +238,67 @@ def main():
 
         train_loss = running_loss / train_steps
         train_accurate = train_acc / train_num
+
+        do_validation = (epoch <= 100) or (epoch > 100 and epoch % 2 == 1)
+        if not args.valid:
+            # 只更新学习率
+            scheduler.step()
+            current_lr = optimizer.state_dict()['param_groups'][0]['lr']
+
+            # 使用占位的验证指标（可用 None 或 0，根据你后续使用场景调整）
+            val_loss = 0.0
+            val_accurate = 0.0
+
+            # 记录到历史列表，方便后面画图时保持长度一致
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            train_accs.append(train_accurate)
+            val_accs.append(val_accurate)
+            lr_history.append(current_lr)
+
+            epoch_time = time.time() - epoch_start
+            print(f'Current learning rate: {current_lr}')
+            print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} train_accuracy:{train_accurate:.3f} '
+                  f'(no validation) time: {epoch_time:.1f}s')
+
+            # 记录到 CSV（验证指标写成 0 或空）
+            with open(results_csv_path, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                                     f"{train_accurate:.6f}", f"{val_accurate:.6f}",
+                                     f"{current_lr:.6f}", f"{epoch_time:.1f}"])
+            # 不做 early stopping / 保存最佳模型 / 画图
+            continue
+
+        # 情况 2：valid=True，根据轮次决定是否验证
+        do_validation = (epoch <= 100) or (epoch > 100 and epoch % 2 == 1)
+
+        # 2.1 当前轮选择不验证（大于 100 的偶数轮）
+        if not do_validation:
+            scheduler.step()
+            current_lr = optimizer.state_dict()['param_groups'][0]['lr']
+
+            val_loss = 0.0
+            val_accurate = 0.0
+
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            train_accs.append(train_accurate)
+            val_accs.append(val_accurate)
+            lr_history.append(current_lr)
+
+            epoch_time = time.time() - epoch_start
+            print(f'Current learning rate: {current_lr}')
+            print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} '
+                  f'train_accuracy:{train_accurate:.3f} (skip validation) '
+                  f'time: {epoch_time:.1f}s')
+
+            with open(results_csv_path, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                                     f"{train_accurate:.6f}", f"{val_accurate:.6f}",
+                                     f"{current_lr:.6f}", f"{epoch_time:.1f}"])
+            continue
 
         # val
         model.eval()
@@ -385,6 +481,25 @@ def main():
         f.write(f"  可视化结果: {model_plot_dir}\n")
 
     print(f"Saved summary results to: {results_txt_path}")
+
+    # 显式释放 DataLoader 和图形资源，减少挂起线程/句柄
+    try:
+        if hasattr(train_loader, 'dataset'):
+            train_loader = None
+        if hasattr(val_loader, 'dataset'):
+            val_loader = None
+    except Exception as e:
+        print(f"清理 DataLoader 时出错: {e}")
+
+    try:
+        plt.close('all')
+    except Exception as e:
+        print(f"关闭 matplotlib 图形时出错: {e}")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     print(f"All results saved to: {model_results_dir}")
 
 
@@ -422,6 +537,35 @@ def visualize_predictions(model, data_loader, classes, device, num_images=10):
                 if images_so_far == num_images:
                     break
 
+def get_unique_path(base_path: str) -> str:
+    """
+    若 `base_path` 已存在，则自动追加 _1, _2 ... 后缀，返回一个未存在的路径。
+    """
+    if not os.path.exists(base_path):
+        return base_path
+
+    dir_name, file_name = os.path.split(base_path)
+    name, ext = os.path.splitext(file_name)
+
+    idx = 1
+    while True:
+        new_name = f"{name}_{idx}{ext}"
+        candidate = os.path.join(dir_name, new_name)
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # 尝试优雅中断，释放资源
+        print("收到手动中断信号，正在安全退出...")
+        try:
+            # 清理 CUDA 资源
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"清理 CUDA 资源时出错: {e}")
+        # 直接退出进程，避免 DataLoader 子进程卡住
+        os._exit(0)
