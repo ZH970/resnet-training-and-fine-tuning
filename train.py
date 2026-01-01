@@ -17,7 +17,7 @@ import time
 import csv
 
 from resnet import ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet20, ResNet32, ResNet44, ResNet56, ResNet110, ResNet1202
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ===================== 参数解析 =====================
 parser = argparse.ArgumentParser(description='CIFAR-10 / CINIC-10 Training & Finetuning with ResNet')
@@ -51,12 +51,14 @@ parser.add_argument('--valid', type=bool, default=True,
 
 parser.add_argument('--pretrained-path', type=str, default=None,
                     help='预训练模型 pth 路径（如: results/ResNet18/ResNet18_best.pth）')
+
 parser.add_argument(
     '--resume-path',
     type=str,
     default=None,
     help='从检查点恢复训练的路径（.pth），会加载模型和优化器状态并从对应 epoch 继续'
 )
+
 # 显式布尔类型参数：--freeze-backbone True/False
 parser.add_argument(
     '--freeze-backbone',
@@ -87,6 +89,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch,
         ckpt["extra"] = extra
     torch.save(ckpt, path)
     print(f"[Checkpoint] Saved to {path} (epoch={epoch})")
+
+
 def visualize_predictions_random(model, dataset, classes, device, num_images=10):
     model.eval()
     indices = random.sample(range(len(dataset)), num_images)
@@ -114,6 +118,7 @@ def visualize_predictions_random(model, dataset, classes, device, num_images=10)
 
             ax.imshow(inp)
 
+
 def get_unique_path(base_path: str) -> str:
     """
     若 `base_path` 已存在，则自动追加 _1, _2 ... 后缀，返回一个未存在的路径。
@@ -134,7 +139,7 @@ def get_unique_path(base_path: str) -> str:
 
 
 def visualize_predictions(model, data_loader, classes, device, num_images=10):
-    """Visualize model predictions"""
+    """Visualize model predictions（保留原函数以防仍有调用）"""
     model.eval()
     images_so_far = 0
     fig = plt.figure(figsize=(15, 8))
@@ -176,7 +181,7 @@ def setup_finetune(model, phase, base_lr):
       0: 全网训练（普通训练，不区分阶段）
       1: 冻结 backbone，仅训练 fc（线性探测）
       2: 解冻 layer4 + fc（主微调）
-      3: 解冻 layer3 + layer4 + fc（更精细微调，可选）
+      3: 解冻 layer3 + layer4 + fc（更精细微调）
 
     返回:
       optimizer
@@ -223,7 +228,7 @@ def setup_finetune(model, phase, base_lr):
                     p for n, p in model.named_parameters()
                     if p.requires_grad and n.startswith("fc")
                 ],
-                "lr": base_lr * 0.5  # 例如 0.05
+                "lr": base_lr * 0.7  # 例如 0.05
             }
         )
         param_groups.append(
@@ -232,7 +237,7 @@ def setup_finetune(model, phase, base_lr):
                     p for n, p in model.named_parameters()
                     if p.requires_grad and n.startswith("layer4")
                 ],
-                "lr": base_lr * 0.2  # 例如 0.01
+                "lr": base_lr * 0.3  # 例如 0.02
             }
         )
 
@@ -320,6 +325,16 @@ def main():
                              (0.2023, 0.1994, 0.2010)),
     ])
 
+    cinic_transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+        # 为cinic10添加随机擦除增强
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3))
+    ])
+
     print("Loading datasets...")
     if args.dataset == 'CIFAR10':
         train_dataset = torchvision.datasets.CIFAR10(
@@ -329,7 +344,7 @@ def main():
         if args.model in ['ResNet20', 'ResNet32', 'ResNet44', 'ResNet56', 'ResNet110', 'ResNet1202']:
             num_classes = 10
             classes = ('plane', 'car', 'bird', 'cat', 'deer',
-                   'dog', 'frog', 'horse', 'ship', 'truck')
+                       'dog', 'frog', 'horse', 'ship', 'truck')
         else:
             classes = val_dataset.classes
             num_classes = len(classes)
@@ -337,7 +352,7 @@ def main():
         cinic_root = './data/cinic'
         train_dataset = torchvision.datasets.ImageFolder(
             root=os.path.join(cinic_root, 'train'),
-            transform=transform_train
+            transform=cinic_transform_train
         )
         val_dataset = torchvision.datasets.ImageFolder(
             root=os.path.join(cinic_root, 'valid'),
@@ -415,18 +430,18 @@ def main():
         optimizer = setup_finetune(model, phase=current_phase, base_lr=LR)
         print("[Train] Full model training (no staged finetuning).")
 
-    # 学习率调度
-    if model_name in ['ResNet20', 'ResNet32', 'ResNet44', 'ResNet56', 'ResNet110', 'ResNet1202']:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=[82, 123], gamma=0.1)
-    elif args.dataset == 'Cinic10':
-        # T_max 用总 epoch，更符合完整 cosine 周期；其余参数保持默认
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs
-        )
+    # 学习率调度：CINIC-10 用 Cosine + 分阶段，其他保持接近原逻辑
+    if args.dataset == 'Cinic10':
+
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+        print(f"[Cinic10] Using CosineAnnealingLR(T_max={epochs})")
     else:
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, milestones=[82, 123], gamma=0.1)
+        if model_name in ['ResNet20', 'ResNet32', 'ResNet44', 'ResNet56', 'ResNet110', 'ResNet1202']:
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=[82, 123], gamma=0.1)
+        else:
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=[82, 123], gamma=0.1)
 
     start_epoch = 0
     train_losses, val_losses = [], []
@@ -437,6 +452,7 @@ def main():
     best_epoch = 0
     best_train_acc, best_train_loss = 0.0, 0.0
 
+    # 断点恢复
     if args.resume_path is not None and os.path.exists(args.resume_path):
         print(f"[Resume] Loading checkpoint from {args.resume_path}")
         ckpt = torch.load(args.resume_path, map_location=device)
@@ -453,7 +469,6 @@ def main():
 
         start_epoch = ckpt.get("epoch", 0)
 
-        # 恢复历史曲线
         train_losses = ckpt.get("train_losses", [])
         val_losses = ckpt.get("val_losses", [])
         train_accs = ckpt.get("train_accs", [])
@@ -483,11 +498,11 @@ def main():
         for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
 
-            # 微调模式下：根据 epoch 切换阶段
+            # 微调模式下：根据 epoch 切换阶段（只改 optimizer param_group，scheduler 保持 Cosine/Step）
             if args.freeze_backbone:
-                if epoch < 5:
+                if epoch < 2:
                     phase = 1
-                elif epoch < 100:
+                elif epoch < 60:
                     phase = 2
                 else:
                     phase = 3
@@ -498,6 +513,9 @@ def main():
                     optimizer = setup_finetune(model, phase=current_phase, base_lr=LR)
                     if current_phase == 1:
                         model.apply(lambda m: isinstance(m, nn.BatchNorm2d) and m.eval())
+                    if args.dataset == 'Cinic10':
+                        # 切换阶段时把余弦退火也绑定一下
+                        scheduler = CosineAnnealingLR(optimizer, T_max=epochs - epoch)
 
             # train
             print(f"------- Epoch {epoch + 1} training start -------")
@@ -524,7 +542,6 @@ def main():
             train_loss = running_loss / train_steps
             train_accurate = train_acc / train_num
 
-            # 不做验证的情况
             if not args.valid:
                 scheduler.step()
                 current_lr = optimizer.state_dict()['param_groups'][0]['lr']
@@ -628,10 +645,9 @@ def main():
                                      f"{train_accurate:.6f}", f"{val_accurate:.6f}",
                                      f"{current_lr:.6f}", f"{epoch_time:.1f}"])
 
-            # 每 5 个 epoch 保存一次（你可以改成每 1 个）
+            # 周期性保存 latest 检查点
             if (epoch + 1) % 10 == 0:
                 latest_ckpt_path = os.path.join(model_results_dir, f"{model_name}_latest.pth")
-
                 save_checkpoint(
                     latest_ckpt_path,
                     model,
@@ -645,10 +661,12 @@ def main():
                         "best_epoch": best_epoch,
                     },
                 )
+
             if val_loss < best_loss:
                 best_loss = val_loss
                 print(f"Validation loss improved to {best_loss:.6f}")
 
+            # ================= 仅在 acc 变好时保存 best & 可视化 =================
             if val_accurate > best_acc:
                 best_acc = val_accurate
                 best_epoch = epoch + 1
@@ -665,7 +683,6 @@ def main():
                 }, model_filename)
                 print(f"Found better model, saved to: {model_filename}")
 
-                # 混淆矩阵
                 cm = confusion_matrix(all_labels, all_preds)
                 plt.figure(figsize=(10, 8))
                 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -679,19 +696,18 @@ def main():
                 plt.close()
                 print(f"Saved confusion matrix to: {confusion_matrix_path}")
 
-                # 部分预测可视化
                 visualize_predictions_random(model, val_dataset, classes, device)
                 pred_path = os.path.join(model_plot_dir, f"predictions.png")
                 plt.savefig(pred_path)
                 plt.close()
                 print(f"Saved prediction visualization to: {pred_path}")
 
-            # 损失 & 准确率曲线
+            # ================= 每轮都绘制 loss/acc 和 lr 曲线，保证完整 =================
             plt.figure(figsize=(11, 5))
-            plt.subplot(0, 2, 1)
-            plt.plot(range(0, len(train_losses) + 1),
+            plt.subplot(1, 2, 1)
+            plt.plot(range(1, len(train_losses) + 1),
                      train_losses, label='Training Loss')
-            plt.plot(range(0, len(val_losses) + 1),
+            plt.plot(range(1, len(val_losses) + 1),
                      val_losses, label='Validation Loss')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
@@ -699,10 +715,10 @@ def main():
             plt.legend()
             plt.grid(True)
 
-            plt.subplot(0, 2, 2)
-            plt.plot(range(0, len(train_accs) + 1),
+            plt.subplot(1, 2, 2)
+            plt.plot(range(1, len(train_accs) + 1),
                      train_accs, label='Training Accuracy')
-            plt.plot(range(0, len(val_accs) + 1),
+            plt.plot(range(1, len(val_accs) + 1),
                      val_accs, label='Validation Accuracy')
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy')
@@ -717,9 +733,8 @@ def main():
             plt.close()
             print(f"Saved loss and accuracy curves to: {loss_acc_path}")
 
-            # 学习率曲线
             plt.figure(figsize=(9, 5))
-            plt.plot(range(0, len(lr_history) + 1), lr_history)
+            plt.plot(range(1, len(lr_history) + 1), lr_history)
             plt.xlabel('Epoch')
             plt.ylabel('Learning Rate')
             plt.title(f'{model_name} Learning Rate Curve')
@@ -729,6 +744,7 @@ def main():
             plt.savefig(lr_path)
             plt.close()
             print(f"Saved learning rate curve to: {lr_path}")
+
     except KeyboardInterrupt:
         interrupt_ckpt_path = os.path.join(
             model_results_dir, f"{model_name}_interrupt.pth"
@@ -751,7 +767,6 @@ def main():
         except Exception as e:
             print(f"保存中断检查点失败: {e}")
         finally:
-            # 清理
             try:
                 plt.close('all')
             except Exception:
@@ -770,7 +785,6 @@ def main():
     minutes, seconds = divmod(remainder, 60)
     print(f"Total training time: {int(hours)}h {int(minutes)}m {seconds:.2f}s")
 
-    # Save final summary to txt file
     with open(results_txt_path, 'w') as f:
         f.write(f"模型: {model_name}\n")
         f.write(f"训练参数:\n")
@@ -795,7 +809,6 @@ def main():
 
     print(f"Saved summary results to: {results_txt_path}")
 
-    # 清理
     try:
         if hasattr(train_loader, 'dataset'):
             train_loader = None
@@ -817,13 +830,4 @@ def main():
 
 
 if __name__ == "__main__":
-    #try:
     main()
-    # except KeyboardInterrupt:
-    #     print("收到手动中断信号，正在安全退出...")
-    #     try:
-    #         if torch.cuda.is_available():
-    #             torch.cuda.empty_cache()
-    #     except Exception as e:
-    #         print(f"清理 CUDA 资源时出错: {e}")
-    #     os._exit(0)
