@@ -232,7 +232,7 @@ def setup_finetune(model, phase, base_lr):
                     p for n, p in model.named_parameters()
                     if p.requires_grad and n.startswith("layer4")
                 ],
-                "lr": base_lr * 0.1  # 例如 0.01
+                "lr": base_lr * 0.2  # 例如 0.01
             }
         )
 
@@ -343,9 +343,8 @@ def main():
             root=os.path.join(cinic_root, 'valid'),
             transform=transform_test
         )
-        num_classes = 10
-        classes = ('plane', 'car', 'bird', 'cat', 'deer',
-                   'dog', 'frog', 'horse', 'ship', 'truck')
+        classes = val_dataset.classes
+        num_classes = len(classes)
     else:
         raise ValueError(f"暂未实现数据集：{args.dataset}")
 
@@ -420,13 +419,14 @@ def main():
     if model_name in ['ResNet20', 'ResNet32', 'ResNet44', 'ResNet56', 'ResNet110', 'ResNet1202']:
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=[82, 123], gamma=0.1)
+    elif args.dataset == 'Cinic10':
+        # T_max 用总 epoch，更符合完整 cosine 周期；其余参数保持默认
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs
+        )
     else:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, milestones=[82, 123], gamma=0.1)
-
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
-    lr_history = []
 
     start_epoch = 0
     train_losses, val_losses = [], []
@@ -679,56 +679,56 @@ def main():
                 plt.close()
                 print(f"Saved confusion matrix to: {confusion_matrix_path}")
 
-                # 损失 & 准确率曲线
-                plt.figure(figsize=(12, 5))
-                plt.subplot(1, 2, 1)
-                plt.plot(range(1, len(train_losses) + 1),
-                         train_losses, label='Training Loss')
-                plt.plot(range(1, len(val_losses) + 1),
-                         val_losses, label='Validation Loss')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.title(f'{model_name} Loss Curves')
-                plt.legend()
-                plt.grid(True)
-
-                plt.subplot(1, 2, 2)
-                plt.plot(range(1, len(train_accs) + 1),
-                         train_accs, label='Training Accuracy')
-                plt.plot(range(1, len(val_accs) + 1),
-                         val_accs, label='Validation Accuracy')
-                plt.xlabel('Epoch')
-                plt.ylabel('Accuracy')
-                plt.title(f'{model_name} Accuracy Curves')
-                plt.legend()
-                plt.grid(True)
-
-                plt.tight_layout()
-                loss_acc_path = os.path.join(
-                    model_plot_dir, f"loss_acc_curves.png")
-                plt.savefig(loss_acc_path)
-                plt.close()
-                print(f"Saved loss and accuracy curves to: {loss_acc_path}")
-
-                # 学习率曲线
-                plt.figure(figsize=(10, 5))
-                plt.plot(range(1, len(lr_history) + 1), lr_history)
-                plt.xlabel('Epoch')
-                plt.ylabel('Learning Rate')
-                plt.title(f'{model_name} Learning Rate Curve')
-                plt.grid(True)
-                plt.yscale('log')
-                lr_path = os.path.join(model_plot_dir, f"lr_curve.png")
-                plt.savefig(lr_path)
-                plt.close()
-                print(f"Saved learning rate curve to: {lr_path}")
-
                 # 部分预测可视化
                 visualize_predictions_random(model, val_dataset, classes, device)
                 pred_path = os.path.join(model_plot_dir, f"predictions.png")
                 plt.savefig(pred_path)
                 plt.close()
                 print(f"Saved prediction visualization to: {pred_path}")
+
+            # 损失 & 准确率曲线
+            plt.figure(figsize=(11, 5))
+            plt.subplot(0, 2, 1)
+            plt.plot(range(0, len(train_losses) + 1),
+                     train_losses, label='Training Loss')
+            plt.plot(range(0, len(val_losses) + 1),
+                     val_losses, label='Validation Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title(f'{model_name} Loss Curves')
+            plt.legend()
+            plt.grid(True)
+
+            plt.subplot(0, 2, 2)
+            plt.plot(range(0, len(train_accs) + 1),
+                     train_accs, label='Training Accuracy')
+            plt.plot(range(0, len(val_accs) + 1),
+                     val_accs, label='Validation Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.title(f'{model_name} Accuracy Curves')
+            plt.legend()
+            plt.grid(True)
+
+            plt.tight_layout()
+            loss_acc_path = os.path.join(
+                model_plot_dir, f"loss_acc_curves.png")
+            plt.savefig(loss_acc_path)
+            plt.close()
+            print(f"Saved loss and accuracy curves to: {loss_acc_path}")
+
+            # 学习率曲线
+            plt.figure(figsize=(9, 5))
+            plt.plot(range(0, len(lr_history) + 1), lr_history)
+            plt.xlabel('Epoch')
+            plt.ylabel('Learning Rate')
+            plt.title(f'{model_name} Learning Rate Curve')
+            plt.grid(True)
+            plt.yscale('log')
+            lr_path = os.path.join(model_plot_dir, f"lr_curve.png")
+            plt.savefig(lr_path)
+            plt.close()
+            print(f"Saved learning rate curve to: {lr_path}")
     except KeyboardInterrupt:
         interrupt_ckpt_path = os.path.join(
             model_results_dir, f"{model_name}_interrupt.pth"
