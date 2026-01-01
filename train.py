@@ -51,7 +51,12 @@ parser.add_argument('--valid', type=bool, default=True,
 
 parser.add_argument('--pretrained-path', type=str, default=None,
                     help='预训练模型 pth 路径（如: results/ResNet18/ResNet18_best.pth）')
-
+parser.add_argument(
+    '--resume-path',
+    type=str,
+    default=None,
+    help='从检查点恢复训练的路径（.pth），会加载模型和优化器状态并从对应 epoch 继续'
+)
 # 显式布尔类型参数：--freeze-backbone True/False
 parser.add_argument(
     '--freeze-backbone',
@@ -64,18 +69,24 @@ args = parser.parse_args()
 
 
 # ===================== 一些辅助函数 =====================
-def save_checkpoint(path, model, optimizer, scheduler, epoch, extra=None):
+def save_checkpoint(path, model, optimizer, scheduler, epoch,
+                    train_losses, val_losses, train_accs, val_accs, lr_history,
+                    extra=None):
     ckpt = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "epoch": epoch,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "train_accs": train_accs,
+        "val_accs": val_accs,
+        "lr_history": lr_history,
     }
     if extra is not None:
         ckpt["extra"] = extra
     torch.save(ckpt, path)
     print(f"[Checkpoint] Saved to {path} (epoch={epoch})")
-
 def visualize_predictions_random(model, dataset, classes, device, num_images=10):
     model.eval()
     indices = random.sample(range(len(dataset)), num_images)
@@ -315,9 +326,13 @@ def main():
             root='./data', train=True, download=True, transform=transform_train)
         val_dataset = torchvision.datasets.CIFAR10(
             root='./data', train=False, download=True, transform=transform_test)
-        num_classes = 10
-        classes = ('plane', 'car', 'bird', 'cat', 'deer',
+        if args.model in ['ResNet20', 'ResNet32', 'ResNet44', 'ResNet56', 'ResNet110', 'ResNet1202']:
+            num_classes = 10
+            classes = ('plane', 'car', 'bird', 'cat', 'deer',
                    'dog', 'frog', 'horse', 'ship', 'truck')
+        else:
+            classes = val_dataset.classes
+            num_classes = len(classes)
     elif args.dataset == 'Cinic10':
         cinic_root = './data/cinic'
         train_dataset = torchvision.datasets.ImageFolder(
@@ -413,10 +428,47 @@ def main():
     train_accs, val_accs = [], []
     lr_history = []
 
+    start_epoch = 0
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+    lr_history = []
     best_acc = 0.0
     best_loss = float('inf')
     best_epoch = 0
     best_train_acc, best_train_loss = 0.0, 0.0
+
+    if args.resume_path is not None and os.path.exists(args.resume_path):
+        print(f"[Resume] Loading checkpoint from {args.resume_path}")
+        ckpt = torch.load(args.resume_path, map_location=device)
+
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+        if ckpt.get("optimizer_state_dict") is not None:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            print("[Resume] Optimizer state loaded.")
+
+        if ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            print("[Resume] Scheduler state loaded.")
+
+        start_epoch = ckpt.get("epoch", 0)
+
+        # 恢复历史曲线
+        train_losses = ckpt.get("train_losses", [])
+        val_losses = ckpt.get("val_losses", [])
+        train_accs = ckpt.get("train_accs", [])
+        val_accs = ckpt.get("val_accs", [])
+        lr_history = ckpt.get("lr_history", [])
+
+        extra = ckpt.get("extra", {})
+        best_acc = extra.get("best_acc", 0.0)
+        best_loss = extra.get("best_loss", float('inf'))
+        best_epoch = extra.get("best_epoch", 0)
+
+        print(f"[Resume] Resume from epoch {start_epoch}, best_acc={best_acc:.4f}, best_loss={best_loss:.4f}")
+    else:
+        if args.resume_path is not None:
+            print(f"[Resume] resume-path 不存在：{args.resume_path}，跳过恢复。")
 
     # CSV logging
     with open(results_csv_path, 'w', newline='') as csvfile:
@@ -427,238 +479,287 @@ def main():
     start_time = time.time()
 
     # ===================== 训练循环 =====================
-    for epoch in range(epochs):
-        epoch_start = time.time()
+    try:
+        for epoch in range(start_epoch, epochs):
+            epoch_start = time.time()
 
-        # 微调模式下：根据 epoch 切换阶段
-        if args.freeze_backbone:
-            if epoch < 5:
-                phase = 1
-            elif epoch < 100:
-                phase = 2
-            else:
-                phase = 3
+            # 微调模式下：根据 epoch 切换阶段
+            if args.freeze_backbone:
+                if epoch < 5:
+                    phase = 1
+                elif epoch < 100:
+                    phase = 2
+                else:
+                    phase = 3
 
-            if phase != current_phase:
-                print(f"[Finetune] Switch to phase {phase} at epoch {epoch + 1}")
-                current_phase = phase
-                optimizer = setup_finetune(model, phase=current_phase, base_lr=LR)
-                if current_phase == 1:
-                    model.apply(lambda m: isinstance(m, nn.BatchNorm2d) and m.eval())
+                if phase != current_phase:
+                    print(f"[Finetune] Switch to phase {phase} at epoch {epoch + 1}")
+                    current_phase = phase
+                    optimizer = setup_finetune(model, phase=current_phase, base_lr=LR)
+                    if current_phase == 1:
+                        model.apply(lambda m: isinstance(m, nn.BatchNorm2d) and m.eval())
 
-        # train
-        print(f"------- Epoch {epoch + 1} training start -------")
-        model.train()
-        train_acc = 0.0
-        running_loss = 0.0
-        train_bar = tqdm(train_loader, file=sys.stdout)
-        for step, data in enumerate(train_bar):
-            images, labels = data
-            images, labels = images.to(device), labels.to(device)
+            # train
+            print(f"------- Epoch {epoch + 1} training start -------")
+            model.train()
+            train_acc = 0.0
+            running_loss = 0.0
+            train_bar = tqdm(train_loader, file=sys.stdout)
+            for step, data in enumerate(train_bar):
+                images, labels = data
+                images, labels = images.to(device), labels.to(device)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = loss_function(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
-            running_loss += loss.item()
-            train_bar.desc = f"train epoch[{epoch + 1}/{epochs}] loss:{loss:.3f}"
-
-            _, predict = torch.max(outputs, dim=1)
-            train_acc += torch.eq(predict, labels).sum().item()
-
-        train_loss = running_loss / train_steps
-        train_accurate = train_acc / train_num
-
-        # 不做验证的情况
-        if not args.valid:
-            scheduler.step()
-            current_lr = optimizer.state_dict()['param_groups'][0]['lr']
-
-            val_loss = 0.0
-            val_accurate = 0.0
-
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            train_accs.append(train_accurate)
-            val_accs.append(val_accurate)
-            lr_history.append(current_lr)
-
-            epoch_time = time.time() - epoch_start
-            print(f'Current learning rate: {current_lr}')
-            print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} '
-                  f'train_accuracy:{train_accurate:.3f} (no validation) time: {epoch_time:.1f}s')
-
-            with open(results_csv_path, 'a', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile)
-                csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
-                                     f"{train_accurate:.6f}", f"{val_accurate:.6f}",
-                                     f"{current_lr:.6f}", f"{epoch_time:.1f}"])
-            continue
-
-        # valid=True 时的验证频率控制
-        do_validation = (epoch <= 100) or (epoch > 100 and epoch % 2 == 1)
-
-        if not do_validation:
-            scheduler.step()
-            current_lr = optimizer.state_dict()['param_groups'][0]['lr']
-
-            val_loss = 0.0
-            val_accurate = 0.0
-
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            train_accs.append(train_accurate)
-            val_accs.append(val_accurate)
-            lr_history.append(current_lr)
-
-            epoch_time = time.time() - epoch_start
-            print(f'Current learning rate: {current_lr}')
-            print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} '
-                  f'train_accuracy:{train_accurate:.3f} (skip validation) '
-                  f'time: {epoch_time:.1f}s')
-
-            with open(results_csv_path, 'a', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile)
-                csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
-                                     f"{train_accurate:.6f}", f"{val_accurate:.6f}",
-                                     f"{current_lr:.6f}", f"{epoch_time:.1f}"])
-            continue
-
-        # 验证
-        model.eval()
-        val_acc = 0.0
-        val_running_loss = 0.0
-
-        all_preds = []
-        all_labels = []
-
-        with torch.no_grad():
-            val_bar = tqdm(val_loader, file=sys.stdout)
-            for step, val_data in enumerate(val_bar):
-                val_images, val_labels = val_data
-                val_images, val_labels = val_images.to(device), val_labels.to(device)
-
-                outputs = model(val_images)
-                loss = loss_function(outputs, val_labels)
-
-                val_running_loss += loss.item()
+                running_loss += loss.item()
+                train_bar.desc = f"train epoch[{epoch + 1}/{epochs}] loss:{loss:.3f}"
 
                 _, predict = torch.max(outputs, dim=1)
-                val_acc += torch.eq(predict, val_labels).sum().item()
+                train_acc += torch.eq(predict, labels).sum().item()
 
-                all_preds.extend(predict.cpu().numpy())
-                all_labels.extend(val_labels.cpu().numpy())
+            train_loss = running_loss / train_steps
+            train_accurate = train_acc / train_num
 
-        val_loss = val_running_loss / val_steps
-        val_accurate = val_acc / val_num
+            # 不做验证的情况
+            if not args.valid:
+                scheduler.step()
+                current_lr = optimizer.state_dict()['param_groups'][0]['lr']
 
-        scheduler.step()
-        current_lr = optimizer.state_dict()['param_groups'][0]['lr']
+                val_loss = 0.0
+                val_accurate = 0.0
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_accurate)
-        val_accs.append(val_accurate)
-        lr_history.append(current_lr)
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                train_accs.append(train_accurate)
+                val_accs.append(val_accurate)
+                lr_history.append(current_lr)
 
-        epoch_time = time.time() - epoch_start
+                epoch_time = time.time() - epoch_start
+                print(f'Current learning rate: {current_lr}')
+                print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} '
+                      f'train_accuracy:{train_accurate:.3f} (no validation) time: {epoch_time:.1f}s')
 
-        print(f'Current learning rate: {current_lr}')
-        print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} val_loss:{val_loss:.3f} '
-              f'train_accuracy:{train_accurate:.3f} val_accuracy: {val_accurate:.3f} time: {epoch_time:.1f}s')
+                with open(results_csv_path, 'a', newline='') as csvfile:
+                    csv_writer = csv.writer(csvfile)
+                    csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                                         f"{train_accurate:.6f}", f"{val_accurate:.6f}",
+                                         f"{current_lr:.6f}", f"{epoch_time:.1f}"])
+                continue
 
-        with open(results_csv_path, 'a', newline='') as csvfile:
-            csv_writer = csv.writer(csvfile)
-            csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
-                                 f"{train_accurate:.6f}", f"{val_accurate:.6f}",
-                                 f"{current_lr:.6f}", f"{epoch_time:.1f}"])
+            # valid=True 时的验证频率控制
+            do_validation = (epoch <= 100) or (epoch > 100 and epoch % 2 == 1)
 
-        if val_loss < best_loss:
-            best_loss = val_loss
-            print(f"Validation loss improved to {best_loss:.6f}")
+            if not do_validation:
+                scheduler.step()
+                current_lr = optimizer.state_dict()['param_groups'][0]['lr']
 
-        if val_accurate > best_acc:
-            best_acc = val_accurate
-            best_epoch = epoch + 1
-            best_train_acc = train_accurate
-            best_train_loss = train_loss
+                val_loss = 0.0
+                val_accurate = 0.0
 
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "val_accuracy": val_accurate,
-                "val_loss": val_loss,
-                "train_accuracy": train_accurate,
-                "train_loss": train_loss,
-                "epoch": epoch + 1
-            }, model_filename)
-            print(f"Found better model, saved to: {model_filename}")
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                train_accs.append(train_accurate)
+                val_accs.append(val_accurate)
+                lr_history.append(current_lr)
 
-            # 混淆矩阵
-            cm = confusion_matrix(all_labels, all_preds)
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                        xticklabels=classes, yticklabels=classes)
-            plt.xlabel('Predicted Label')
-            plt.ylabel('True Label')
-            plt.title(f'{model_name} Confusion Matrix (Epoch {epoch+1})')
-            confusion_matrix_path = os.path.join(
-                model_plot_dir, f"confusion_matrix.png")
-            plt.savefig(confusion_matrix_path)
-            plt.close()
-            print(f"Saved confusion matrix to: {confusion_matrix_path}")
+                epoch_time = time.time() - epoch_start
+                print(f'Current learning rate: {current_lr}')
+                print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} '
+                      f'train_accuracy:{train_accurate:.3f} (skip validation) '
+                      f'time: {epoch_time:.1f}s')
 
-            # 损失 & 准确率曲线
-            plt.figure(figsize=(12, 5))
-            plt.subplot(1, 2, 1)
-            plt.plot(range(1, len(train_losses) + 1),
-                     train_losses, label='Training Loss')
-            plt.plot(range(1, len(val_losses) + 1),
-                     val_losses, label='Validation Loss')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.title(f'{model_name} Loss Curves')
-            plt.legend()
-            plt.grid(True)
+                with open(results_csv_path, 'a', newline='') as csvfile:
+                    csv_writer = csv.writer(csvfile)
+                    csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                                         f"{train_accurate:.6f}", f"{val_accurate:.6f}",
+                                         f"{current_lr:.6f}", f"{epoch_time:.1f}"])
+                continue
 
-            plt.subplot(1, 2, 2)
-            plt.plot(range(1, len(train_accs) + 1),
-                     train_accs, label='Training Accuracy')
-            plt.plot(range(1, len(val_accs) + 1),
-                     val_accs, label='Validation Accuracy')
-            plt.xlabel('Epoch')
-            plt.ylabel('Accuracy')
-            plt.title(f'{model_name} Accuracy Curves')
-            plt.legend()
-            plt.grid(True)
+            # 验证
+            model.eval()
+            val_acc = 0.0
+            val_running_loss = 0.0
 
-            plt.tight_layout()
-            loss_acc_path = os.path.join(
-                model_plot_dir, f"loss_acc_curves.png")
-            plt.savefig(loss_acc_path)
-            plt.close()
-            print(f"Saved loss and accuracy curves to: {loss_acc_path}")
+            all_preds = []
+            all_labels = []
 
-            # 学习率曲线
-            plt.figure(figsize=(10, 5))
-            plt.plot(range(1, len(lr_history) + 1), lr_history)
-            plt.xlabel('Epoch')
-            plt.ylabel('Learning Rate')
-            plt.title(f'{model_name} Learning Rate Curve')
-            plt.grid(True)
-            plt.yscale('log')
-            lr_path = os.path.join(model_plot_dir, f"lr_curve.png")
-            plt.savefig(lr_path)
-            plt.close()
-            print(f"Saved learning rate curve to: {lr_path}")
+            with torch.no_grad():
+                val_bar = tqdm(val_loader, file=sys.stdout)
+                for step, val_data in enumerate(val_bar):
+                    val_images, val_labels = val_data
+                    val_images, val_labels = val_images.to(device), val_labels.to(device)
 
-            # 部分预测可视化
-            visualize_predictions_random(model, val_dataset, classes, device)
-            pred_path = os.path.join(model_plot_dir, f"predictions.png")
-            plt.savefig(pred_path)
-            plt.close()
-            print(f"Saved prediction visualization to: {pred_path}")
+                    outputs = model(val_images)
+                    loss = loss_function(outputs, val_labels)
+
+                    val_running_loss += loss.item()
+
+                    _, predict = torch.max(outputs, dim=1)
+                    val_acc += torch.eq(predict, val_labels).sum().item()
+
+                    all_preds.extend(predict.cpu().numpy())
+                    all_labels.extend(val_labels.cpu().numpy())
+
+            val_loss = val_running_loss / val_steps
+            val_accurate = val_acc / val_num
+
+            scheduler.step()
+            current_lr = optimizer.state_dict()['param_groups'][0]['lr']
+
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            train_accs.append(train_accurate)
+            val_accs.append(val_accurate)
+            lr_history.append(current_lr)
+
+            epoch_time = time.time() - epoch_start
+
+            print(f'Current learning rate: {current_lr}')
+            print(f'[epoch {epoch + 1}] train_loss: {train_loss:.3f} val_loss:{val_loss:.3f} '
+                  f'train_accuracy:{train_accurate:.3f} val_accuracy: {val_accurate:.3f} time: {epoch_time:.1f}s')
+
+            with open(results_csv_path, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}",
+                                     f"{train_accurate:.6f}", f"{val_accurate:.6f}",
+                                     f"{current_lr:.6f}", f"{epoch_time:.1f}"])
+
+            # 每 5 个 epoch 保存一次（你可以改成每 1 个）
+            if (epoch + 1) % 10 == 0:
+                latest_ckpt_path = os.path.join(model_results_dir, f"{model_name}_latest.pth")
+
+                save_checkpoint(
+                    latest_ckpt_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch + 1,
+                    train_losses, val_losses, train_accs, val_accs, lr_history,
+                    extra={
+                        "best_acc": best_acc,
+                        "best_loss": best_loss,
+                        "best_epoch": best_epoch,
+                    },
+                )
+            if val_loss < best_loss:
+                best_loss = val_loss
+                print(f"Validation loss improved to {best_loss:.6f}")
+
+            if val_accurate > best_acc:
+                best_acc = val_accurate
+                best_epoch = epoch + 1
+                best_train_acc = train_accurate
+                best_train_loss = train_loss
+
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "val_accuracy": val_accurate,
+                    "val_loss": val_loss,
+                    "train_accuracy": train_accurate,
+                    "train_loss": train_loss,
+                    "epoch": epoch + 1
+                }, model_filename)
+                print(f"Found better model, saved to: {model_filename}")
+
+                # 混淆矩阵
+                cm = confusion_matrix(all_labels, all_preds)
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                            xticklabels=classes, yticklabels=classes)
+                plt.xlabel('Predicted Label')
+                plt.ylabel('True Label')
+                plt.title(f'{model_name} Confusion Matrix (Epoch {epoch+1})')
+                confusion_matrix_path = os.path.join(
+                    model_plot_dir, f"confusion_matrix.png")
+                plt.savefig(confusion_matrix_path)
+                plt.close()
+                print(f"Saved confusion matrix to: {confusion_matrix_path}")
+
+                # 损失 & 准确率曲线
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                plt.plot(range(1, len(train_losses) + 1),
+                         train_losses, label='Training Loss')
+                plt.plot(range(1, len(val_losses) + 1),
+                         val_losses, label='Validation Loss')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.title(f'{model_name} Loss Curves')
+                plt.legend()
+                plt.grid(True)
+
+                plt.subplot(1, 2, 2)
+                plt.plot(range(1, len(train_accs) + 1),
+                         train_accs, label='Training Accuracy')
+                plt.plot(range(1, len(val_accs) + 1),
+                         val_accs, label='Validation Accuracy')
+                plt.xlabel('Epoch')
+                plt.ylabel('Accuracy')
+                plt.title(f'{model_name} Accuracy Curves')
+                plt.legend()
+                plt.grid(True)
+
+                plt.tight_layout()
+                loss_acc_path = os.path.join(
+                    model_plot_dir, f"loss_acc_curves.png")
+                plt.savefig(loss_acc_path)
+                plt.close()
+                print(f"Saved loss and accuracy curves to: {loss_acc_path}")
+
+                # 学习率曲线
+                plt.figure(figsize=(10, 5))
+                plt.plot(range(1, len(lr_history) + 1), lr_history)
+                plt.xlabel('Epoch')
+                plt.ylabel('Learning Rate')
+                plt.title(f'{model_name} Learning Rate Curve')
+                plt.grid(True)
+                plt.yscale('log')
+                lr_path = os.path.join(model_plot_dir, f"lr_curve.png")
+                plt.savefig(lr_path)
+                plt.close()
+                print(f"Saved learning rate curve to: {lr_path}")
+
+                # 部分预测可视化
+                visualize_predictions_random(model, val_dataset, classes, device)
+                pred_path = os.path.join(model_plot_dir, f"predictions.png")
+                plt.savefig(pred_path)
+                plt.close()
+                print(f"Saved prediction visualization to: {pred_path}")
+    except KeyboardInterrupt:
+        interrupt_ckpt_path = os.path.join(
+            model_results_dir, f"{model_name}_interrupt.pth"
+        )
+        print("收到 Ctrl+C，中断训练，正在保存中断检查点...")
+        try:
+            save_checkpoint(
+                interrupt_ckpt_path,
+                model,
+                optimizer,
+                scheduler,
+                epoch + 1,
+                train_losses, val_losses, train_accs, val_accs, lr_history,
+                extra={
+                    "best_acc": best_acc,
+                    "best_loss": best_loss,
+                    "best_epoch": best_epoch,
+                },
+            )
+        except Exception as e:
+            print(f"保存中断检查点失败: {e}")
+        finally:
+            # 清理
+            try:
+                plt.close('all')
+            except Exception:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("安全退出。")
 
     print(f"Training complete. Best model saved to: {model_filename}")
     print(
@@ -716,13 +817,13 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("收到手动中断信号，正在安全退出...")
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"清理 CUDA 资源时出错: {e}")
-        os._exit(0)
+    #try:
+    main()
+    # except KeyboardInterrupt:
+    #     print("收到手动中断信号，正在安全退出...")
+    #     try:
+    #         if torch.cuda.is_available():
+    #             torch.cuda.empty_cache()
+    #     except Exception as e:
+    #         print(f"清理 CUDA 资源时出错: {e}")
+    #     os._exit(0)
