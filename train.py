@@ -180,8 +180,8 @@ def setup_finetune(model, phase, base_lr):
     phase:
       0: 全网训练（普通训练，不区分阶段）
       1: 冻结 backbone，仅训练 fc（线性探测）
-      2: 解冻 layer4 + fc（主微调）
-      3: 解冻 layer3 + layer4 + fc（更精细微调）
+      2: 解冻 layer3 + layer4 + fc（主微调）
+      3: 解冻 layer2 3 + layer4 + fc（更精细微调）
 
     返回:
       optimizer
@@ -217,61 +217,68 @@ def setup_finetune(model, phase, base_lr):
         )
 
     elif phase == 2:
-        # 解冻 layer4 + fc（主微调）
-        for n, p in model.named_parameters():
-            if n.startswith("fc") or n.startswith("layer4"):
-                p.requires_grad = True
-
-        param_groups.append(
-            {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if p.requires_grad and n.startswith("fc")
-                ],
-                "lr": base_lr * 0.7  # 例如 0.05
-            }
-        )
-        param_groups.append(
-            {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if p.requires_grad and n.startswith("layer4")
-                ],
-                "lr": base_lr * 0.3  # 例如 0.02
-            }
-        )
-
-    elif phase == 3:
-        # 解冻 layer3 + layer4 + fc（更细微调）
+        # 主微调：解冻 layer3 + layer4 + fc
         for n, p in model.named_parameters():
             if n.startswith("fc") or n.startswith("layer4") or n.startswith("layer3"):
                 p.requires_grad = True
 
         param_groups.append(
             {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if p.requires_grad and n.startswith("fc")
-                ],
-                "lr": base_lr * 0.25  # 例如 0.025
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("fc")],
+                "lr": base_lr * 0.7,  # 0.07
             }
         )
         param_groups.append(
             {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if p.requires_grad and n.startswith("layer4")
-                ],
-                "lr": base_lr * 0.05  # 例如 0.005
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("layer4")],
+                "lr": base_lr * 0.3,  # 0.03
             }
         )
         param_groups.append(
             {
-                "params": [
-                    p for n, p in model.named_parameters()
-                    if p.requires_grad and n.startswith("layer3")
-                ],
-                "lr": base_lr * 0.02  # 例如 0.002
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("layer3")],
+                "lr": base_lr * 0.15,  # 0.015
+            }
+        )
+
+    elif phase == 3:
+        # 更精细微调：解冻 layer2 + layer3 + layer4 + fc
+        for n, p in model.named_parameters():
+            if (n.startswith("fc")
+                    or n.startswith("layer4")
+                    or n.startswith("layer3")
+                    or n.startswith("layer2")):
+                p.requires_grad = True
+
+        param_groups.append(
+            {
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("fc")],
+                "lr": base_lr * 0.4,  # 0.04
+            }
+        )
+        param_groups.append(
+            {
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("layer4")],
+                "lr": base_lr * 0.15,  # 0.015
+            }
+        )
+        param_groups.append(
+            {
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("layer3")],
+                "lr": base_lr * 0.08,  # 0.008
+            }
+        )
+        param_groups.append(
+            {
+                "params": [p for n, p in model.named_parameters()
+                           if p.requires_grad and n.startswith("layer2")],
+                "lr": base_lr * 0.04,  # 0.004
             }
         )
 
@@ -418,7 +425,7 @@ def main():
     results_csv_path = os.path.join(model_results_dir, f"{model_name}_results.csv")
     results_txt_path = os.path.join(model_results_dir, f"{model_name}_results.txt")
 
-    loss_function = nn.CrossEntropyLoss()
+    loss_function = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     # 优化器 & 微调阶段初始化
     if args.freeze_backbone:
